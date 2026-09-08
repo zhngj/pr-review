@@ -456,6 +456,7 @@ def render(buckets, cfg, labels):
         ("Approvals (unique reviewer × PR)", lambda b: str(b["approvals"]["total"])),
         ("Approval concentration — top-1", lambda b: f_share(b["approvals"]["top1_pct"])),
         ("Approval concentration — top-2", lambda b: f_share(b["approvals"]["top2_pct"])),
+        ("Top-2 approvers", lambda b: ", ".join(f"{r['reviewer']} {r['pct']:.0f}%" for r in b["approvals"]["by_reviewer"][:2]) or "—"),
         ("Review participation — top-1", lambda b: f_share(b["participation"]["top1_pct"])),
         ("Review participation — top-2", lambda b: f_share(b["participation"]["top2_pct"])),
         ("Time to first review — median", lambda b: f_h(b["ttfr_median_h"])),

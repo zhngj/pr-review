@@ -35,6 +35,8 @@
 #         REPOS        list of repo names under OWNER; empty list = every repo of OWNER
 #         HOST         GitHub Enterprise hostname, or None for github.com
 #         START_MONTH  first month to report, "YYYY-MM"
+#         TEAM         list of GitHub logins on the team. Used as the denominator of the participation
+#                      rate and as the rows of the participation matrix; [] = derive from the data
 #    Option B — pass flags:
 #         python3 pr_review_metrics.py --owner my-org --repos portal-backend,portal-frontend
 #         python3 pr_review_metrics.py --host github.company.com --start 2026-06
@@ -50,7 +52,9 @@
 #  OUTPUT
 #  ------
 #  Section 1: the summary table (rows = statistics, columns = months + Total).
-#  Section 2: per-month drill-down lists — top reviewers, PRs merged without review, and the
+#  Section 2: participation matrix — one row per engineer (TEAM roster, or everyone seen), one
+#             column per month: PRs reviewed and the share of that month's PRs they touched.
+#  Section 3: per-month drill-down lists — top reviewers, PRs merged without review, and the
 #             approvals flagged as faster than reading — so a retro can open the actual PRs.
 #  --json writes the same plus per-PR detail; --markdown writes the printed report to a file.
 #
@@ -71,6 +75,10 @@
 #    Substantive   comment or review text that is not prefixed "nit", is not a trivial phrase
 #                  ("LGTM", "+1", …) and has at least MIN_COMMENT_CHARS characters; a
 #                  "changes requested" review always counts.
+#    Participation rate   engineers who reviewed at least one PR in the month / TEAM size (or, with
+#                  no roster, / everyone who authored or reviewed that month). The matrix shows who.
+#    PRs reviewed outside the top-2   share of PRs that received a review from someone other than the
+#                  two most active reviewers: how many PRs would have gone unreviewed without them.
 #    Large PR      additions + deletions >= LARGE_PR_LINES.
 #    Faster-than-reading   for each approval on a PR with >= MIN_LINES_FOR_READING_CHECK lines:
 #                  lines / minutes between the review request aimed at that reviewer (or the earliest
@@ -125,6 +133,7 @@ MIN_LINES_FOR_READING_CHECK = 50        # ignore tiny PRs in the reading-speed c
 MIN_COMMENT_CHARS = 12                  # shorter comments ("LGTM", "+1") are not substantive
 BOTS = ["dependabot", "github-actions", "copilot", "renovate"]   # login substrings treated as bots
 EXCLUDE_AUTHORS = []                    # PR authors to drop entirely (automation accounts)
+TEAM = []                               # team roster logins, e.g. ["alice", "bob"]; [] = derive from data
 NO_NAMES = False                        # True = print reviewer-1, reviewer-2, … instead of logins
 # ------------------------------------------------------------------------------------------------
 
@@ -354,6 +363,19 @@ def compute(prs, cfg, tz, dropped):
         return {"total": total, "top1_pct": pct(top1, total), "top2_pct": pct(top2, total),
                 "by_reviewer": [{"reviewer": k, "count": v, "pct": pct(v, total)} for k, v in ranked]}
 
+    part_shares = shares(participation)
+    top2_names = {r["reviewer"] for r in part_shares["by_reviewer"][:2]}
+    outside_top2 = sum(1 for pr in prs
+                       if ({r["reviewer"] for r in pr["reviews"]} | {c["reviewer"] for c in pr["thread_comments"]}) - top2_names)
+    if cfg["team"]:
+        roster = list(cfg["team"])
+        participants = [x for x in roster if participation.get(x)]
+        denominator_label = "roster"
+    else:
+        roster = sorted(people)
+        participants = sorted(participation)
+        denominator_label = "people seen"
+
     # --- 2. time to first review
     hours, no_review = [], []
     for pr in prs:
@@ -399,8 +421,12 @@ def compute(prs, cfg, tz, dropped):
 
     return {
         "prs": len(prs), "dropped": dropped,
-        "distinct_reviewers": len(participation), "people_seen": len(people),
-        "approvals": shares(approvals), "participation": shares(participation),
+        "distinct_reviewers": len(participation), "people_seen": len(people), "people": sorted(people),
+        "participation_rate": {"participants": len(participants), "denominator": len(roster),
+                               "label": denominator_label,
+                               "non_participants": [x for x in roster if not participation.get(x)]},
+        "prs_outside_top2": outside_top2,
+        "approvals": shares(approvals), "participation": part_shares,
         "ttfr_n": len(vals), "ttfr_median_h": statistics.median(vals) if vals else None,
         "ttfr_p90_h": percentile(vals, 90), "within_sla": sum(1 for v in vals if v <= cfg["sla_hours"]),
         "merged_without_review": no_review, "slowest": sorted(hours, key=lambda h: -h["hours"])[:10],
@@ -413,7 +439,7 @@ def compute(prs, cfg, tz, dropped):
 
 # ============================================================================ report =========
 
-def anonymise(buckets):
+def anonymise(buckets, cfg):
     names = {}
 
     def alias(login):
@@ -427,6 +453,9 @@ def anonymise(buckets):
                 row["reviewer"] = alias(row["reviewer"])
         for row in b["flagged"]:
             row["reviewer"] = alias(row["reviewer"])
+        b["people"] = [alias(x) for x in b["people"]]
+        b["participation_rate"]["non_participants"] = [alias(x) for x in b["participation_rate"]["non_participants"]]
+    return alias
 
 
 def f_pct(n, d):
@@ -452,7 +481,8 @@ def render(buckets, cfg, labels):
     rows = [
         ("Merged PRs analysed", lambda b: str(b["prs"])),
         ("Bot / excluded-author PRs dropped", lambda b: str(b["dropped"])),
-        ("Distinct reviewers / people seen", lambda b: f"{b['distinct_reviewers']} / {b['people_seen']}"),
+        ("Review participation rate", lambda b: f_pct(b["participation_rate"]["participants"], b["participation_rate"]["denominator"])),
+        ("PRs reviewed by someone outside the top-2", lambda b: f_pct(b["prs_outside_top2"], b["prs"])),
         ("Approvals (unique reviewer × PR)", lambda b: str(b["approvals"]["total"])),
         ("Approval concentration — top-1", lambda b: f_share(b["approvals"]["top1_pct"])),
         ("Approval concentration — top-2", lambda b: f_share(b["approvals"]["top2_pct"])),
@@ -479,7 +509,34 @@ def render(buckets, cfg, labels):
         p.append(f"| {label} | " + " | ".join(fn(buckets[c]) if buckets[c]["prs"] else "—" for c in cols) + " |")
     p.append("")
 
-    p.append("## 2. Drill-down by month")
+    denom = buckets["Total"]["participation_rate"]["label"]
+    p.append(f"## 2. Participation matrix  (PRs reviewed; share of that month's merged PRs; denominator = {denom})")
+    p.append("")
+    if cfg["team"]:
+        roster = list(cfg["team"])
+    else:
+        roster = sorted({x for c in labels for x in buckets[c]["people"]})
+    per_month = {c: {r["reviewer"]: r["count"] for r in buckets[c]["participation"]["by_reviewer"]} for c in cols}
+    roster.sort(key=lambda x: -per_month["Total"].get(x, 0))
+    p.append("| Engineer | " + " | ".join(cols) + " |")
+    p.append("|---|" + "---:|" * len(cols))
+    for who in roster:
+        cells = []
+        for c in cols:
+            n = per_month[c].get(who, 0)
+            cells.append("—" if not buckets[c]["prs"] else (f"{n} ({100.0 * n / buckets[c]['prs']:.0f}%)" if n else "0"))
+        p.append(f"| {who} | " + " | ".join(cells) + " |")
+    p.append("| **Participation rate** | " + " | ".join(
+        f_pct(buckets[c]["participation_rate"]["participants"], buckets[c]["participation_rate"]["denominator"]) if buckets[c]["prs"] else "—"
+        for c in cols) + " |")
+    zero = [c for c in labels if buckets[c]["prs"] and buckets[c]["participation_rate"]["non_participants"]]
+    if zero:
+        p.append("")
+        p.append("Did not review any PR: " + "; ".join(
+            f"{c}: " + ", ".join(buckets[c]["participation_rate"]["non_participants"][:12]) for c in zero))
+    p.append("")
+
+    p.append("## 3. Drill-down by month")
     for c in labels:
         b = buckets[c]
         p.append("")
@@ -529,6 +586,7 @@ def main():
     ap.add_argument("--min-comment-chars", dest="min_comment_chars", type=int, default=MIN_COMMENT_CHARS)
     ap.add_argument("--bots", default=",".join(BOTS), help="comma-separated login substrings treated as bots")
     ap.add_argument("--exclude-authors", dest="exclude_authors", default=",".join(EXCLUDE_AUTHORS))
+    ap.add_argument("--team", default=",".join(TEAM), help="comma-separated team roster logins (participation denominator)")
     ap.add_argument("--no-names", dest="no_names", action="store_true", default=NO_NAMES, help="anonymise reviewer logins")
     ap.add_argument("--json", dest="json_out", help="also write all results (with per-PR detail) to this JSON file")
     ap.add_argument("--markdown", dest="md_out", help="also write the report to this Markdown file")
@@ -544,6 +602,7 @@ def main():
         "min_lines_for_reading_check": a.min_lines_for_reading_check, "min_comment_chars": a.min_comment_chars,
         "bots": [b.strip().lower() for b in a.bots.split(",") if b.strip()],
         "exclude_authors": [x.strip() for x in a.exclude_authors.split(",") if x.strip()], "no_names": a.no_names,
+        "team": [x.strip() for x in a.team.split(",") if x.strip()],
     }
     tz = load_tz(cfg["tz"])
     windows = month_windows(cfg["start"], end_date)
@@ -566,7 +625,8 @@ def main():
     if not all_prs:
         sys.exit("No merged PRs found in that window — check OWNER / REPOS / --start.")
     if cfg["no_names"]:
-        anonymise(buckets)
+        alias = anonymise(buckets, cfg)
+        cfg["team"] = [alias(x) for x in cfg["team"]]
 
     labels = [w[0] for w in windows]
     report = render(buckets, cfg, labels)

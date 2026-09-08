@@ -1,0 +1,16 @@
+{
+  "owner": "YOUR-ORG-OR-HANDLE",
+  "repos": ["portal-backend", "portal-frontend", "infra-terraform"],
+  "since": null,
+  "until": null,
+  "host": null,
+  "tz": "America/Toronto",
+  "sla_hours": 24,
+  "large_pr_lines": 200,
+  "reading_speed_lpm": 100,
+  "min_lines_for_reading_check": 50,
+  "min_comment_chars": 12,
+  "bots": ["dependabot", "github-actions", "copilot", "renovate"],
+  "exclude_authors": [],
+  "no_names": false
+}
